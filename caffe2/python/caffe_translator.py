@@ -21,11 +21,11 @@ import argparse
 import copy
 import logging
 import re
-import numpy as np  # noqa
 
-from caffe2.proto import caffe2_pb2, caffe2_legacy_pb2
-from caffe.proto import caffe_pb2
+import numpy as np  # noqa
+from caffe2.proto import caffe2_legacy_pb2, caffe2_pb2
 from caffe2.python import core, utils, workspace
+from caffe.proto import caffe_pb2
 from google.protobuf import text_format
 
 logging.basicConfig()
@@ -198,9 +198,9 @@ def _GetBlobDimMap(net, net_params, dummy_input):
 
 def _GetInputDims(caffe_net):
     input_dims = []
-    if caffe_net.input_dim:
+    if hasattr(caffe_net, 'input_dim') and caffe_net.input_dim:
         input_dims = caffe_net.input_dim
-    elif caffe_net.input_shape:
+    elif hasattr(caffe_net, 'input_shape') and caffe_net.input_shape:
         input_dims = caffe_net.input_shape[0].dim
     elif caffe_net.layer[0].input_param.shape:
         # getting input dimension from first layer
@@ -236,6 +236,7 @@ class TranslatorRegistry(object):
             caffe_ops = []
         if type(caffe_ops) is not list:
             caffe_ops = [caffe_ops]
+
         return caffe_ops, params
 
     @classmethod
@@ -276,8 +277,24 @@ class TranslatorRegistry(object):
             if len(pretrained_layers) > 1:
                 print ('>>> huh? more than one pretrained layer of one name?')
                 print ('>>> Assuming these layers have no trainable parameters (e.g relu or pooling)')
+
                 print ([(pt.name, pt.type) for pt in pretrained_layers])
-                pretrained_blobs = []
+                pt_types = [pt.type for pt in pretrained_layers]
+                if len(set(pt_types)) == len(pt_types):
+                    print ('>>> But, just in case, try to match layer types since types are unique. If not, do not transfer params.')
+                    for pt in pretrained_layers:
+                        if pt.type  == layer.type:
+                            print '  Found matching type {}'.format(layer.type)
+                            print '  Setting pretrained blobs'
+                            pretrained_blobs = [
+                                utils.CaffeBlobToNumpyArray(blob)
+                                for blob in pt.blobs
+                            ]
+                            #print pretrained_blobs
+
+                else:
+                    print ('>>> Setting pretrained blobs = []')
+                    pretrained_blobs = []
 
                 #raise ValueError(
                 #    'huh? more than one pretrained layer of one name?')
@@ -291,15 +308,19 @@ class TranslatorRegistry(object):
                 # no parameter blobs.
                 # print 'No pretrained layer for layer', layer.name
                 pretrained_blobs = []
+
             operators, params = cls.TranslateLayer(
                 layer, pretrained_blobs, is_test, net=net,
                 net_params=net_params, input_dims=input_dims)
+
             net.op.extend(operators)
             net_params.protos.extend(params)
+
         if remove_legacy_pad:
             assert input_dims, \
                    'Please specify input_dims to remove legacy_pad'
             net = _RemoveLegacyPad(net, net_params, input_dims)
+
         return net, net_params
 
 
@@ -525,6 +546,94 @@ def TranslateCrop(layer, pretrained_blobs, is_test, **kwargs):
     AddArgument(op, "starts", starts)
     AddArgument(op, "ends", ends)
     return op, []
+
+@TranslatorRegistry.Register("Slice")
+def TranslateSlice(layer, pretrained_blobs, is_test, **kwargs):
+    '''
+    Todo:
+        1. We need to create X caffe2 slice layers, where X = number of tops from original caffe slice layer
+        2. The name / top of these caffe2 layers should correspond to the tops of original caffe slice layer
+        3. The bottom of these caffe2 slice layers should all be the same bottom as the original caffe slice layer.
+        4. No pretrained weights required. Just compute the start / end indices.
+    '''
+    # Slice operates on a single bottom.
+    assert len(layer.bottom) == 1
+
+    # Compute input dimensions.
+    print '>>> Computing input dimensions'
+    net, net_params, input_dims = kwargs['net'], kwargs['net_params'], kwargs['input_dims']
+    n, c, h, w = input_dims
+    dummy_input = np.random.randn(n, c, h, w).astype(np.float32)
+    if len(net.op) == 0:
+        print '>>> Input is an input layer {}. Using input dims instead of calling _GetBlobDimMap'.format(layer.bottom)
+        dim_map = {}
+        dim_map[layer.bottom[0]] = input_dims
+    else:
+        print '>>> Calling _GetBlobDimMap'
+        dim_map = _GetBlobDimMap(net, net_params, dummy_input)
+
+    input_layer_dims = dim_map[layer.bottom[0]]
+
+    # Compute number of tops (i.e. number of Slice layers to create)
+    num_tops = len(layer.top)
+    print '>>> {} tops'.format(num_tops)
+
+    slice_param = layer.slice_param
+    slice_points = slice_param.slice_point
+    assert len(slice_points) + 1 == num_tops
+
+    slice_axis = slice_param.axis
+    print '>>> Slice axis: {}'.format(slice_axis)
+
+    slice_points = [int(sp) for sp in slice_points]
+    # Add end point to slice points so don't have to compute /end/ later.
+    slice_points.extend([-1])
+
+    ops = []
+    params = []
+    slice_start = 0
+    for top_i in range(num_tops):
+        # Compute start and end indices
+        starts, ends = [], []
+        #dims = len(dim_map[input_1])
+
+        #for _ in range(axis):
+        #    starts.append(0)
+        #    ends.append(-1)
+        #end_offset = [int(offsets[0] + input_1_dim[i]) for i in range(axis, dims)]
+        #ends.extend(end_offset)
+        #starts.extend([offsets[0]] * len(end_offset))
+
+        for axis in range(len(input_layer_dims)):
+            if axis != slice_axis:
+                # Keep everything in this dimension
+                starts.append(0)
+                ends.append(-1)
+            else: # Take the appropriate slice.
+                starts.append(slice_start)
+                ends.append(slice_points[top_i])
+                slice_start += slice_points[top_i]
+
+        print '>>>    Working on top {}: {}'.format(top_i, layer.top[top_i])
+        print '>>>    slice starts:{}'.format(starts)
+        print '>>>    slice ends:  {}'.format(ends)
+
+        # Don't use BaseTranslate directly because we don't want all original outputs in output layer
+        # (Remember that we are generating separate slice layers for each original output)
+        caffe_op = BaseTranslate(layer, "Slice")
+        op = caffe2_pb2.OperatorDef()
+        op.input.extend([caffe_op.input[0]])
+        op.output.extend([caffe_op.output[top_i]])
+        op.arg.extend(caffe_op.arg)
+        op.type = caffe_op.type
+        AddArgument(op, "starts", starts)
+        AddArgument(op, "ends", ends)
+
+        # How to connect multiple output operators appropriately?
+        # Answer: TranslateModel simply keeps track of all operators and params by extending op, param to list
+        ops.extend([op])
+
+    return ops, params
 
 @TranslatorRegistry.Register("ReLU")
 def TranslateRelu(layer, pretrained_blobs, is_test, **kwargs):
@@ -970,8 +1079,11 @@ if __name__ == '__main__':
     init_net = ConvertTensorProtosToInitNet(pretrained_params, external_input)
 
     with open(output_predict_net, 'wb') as f:
+        print 'Writing output to: {}'.format(output_predict_net)
         f.write(net.SerializeToString())
     with open(output_predict_net + 'txt', 'w') as f:
+        print 'Writing output to: {}'.format(output_predict_net+'txt')
         f.write(str(net))
     with open(output_init_net, 'wb') as f:
+        print 'Writing output to: {}'.format(output_init_net)
         f.write(init_net.SerializeToString())
