@@ -227,8 +227,11 @@ class TranslatorRegistry(object):
             caffe_ops, params = cls.registry_[layer.type](
                 layer, pretrained_blobs, is_test, **kwargs)
         except KeyError:
-            raise KeyError('No translator registered for layer: %s yet.' %
-                           str(layer))
+            print 'Layer not registered.. just let it pass and see what happens'
+            caffe_ops = []
+            params =[]
+            #raise KeyError('No translator registered for layer: %s yet.' %
+            #               str(layer.type))
         if caffe_ops is None:
             caffe_ops = []
         if type(caffe_ops) is not list:
@@ -271,8 +274,13 @@ class TranslatorRegistry(object):
                                              if l.name == layer.name]
             )
             if len(pretrained_layers) > 1:
-                raise ValueError(
-                    'huh? more than one pretrained layer of one name?')
+                print ('>>> huh? more than one pretrained layer of one name?')
+                print ('>>> Assuming these layers have no trainable parameters (e.g relu or pooling)')
+                print ([(pt.name, pt.type) for pt in pretrained_layers])
+                pretrained_blobs = []
+
+                #raise ValueError(
+                #    'huh? more than one pretrained layer of one name?')
             elif len(pretrained_layers) == 1:
                 pretrained_blobs = [
                     utils.CaffeBlobToNumpyArray(blob)
@@ -761,9 +769,34 @@ def TranslateScale(layer, pretrained_blobs, is_test, **kwargs):
     AddArgument(mul_op, "axis", scale_param.axis)
     AddArgument(mul_op, "broadcast", True)
     if len(mul_op.input) == 1:
+
+        # This crashes if the prototxt has a layer (e.g. pred_ab) that isn't present in caffemodel.
+        # Although the blobs are not defined, the filler param in scale_param
+        # should define what the blobs value(s) should be.
+        # Unfortunately, difficult to determine shape of blob. Need to read code more to understand how to do it.
+
+        #pretrained_blobs = [
+        #    utils.CaffeBlobToNumpyArray(blob)
+        #    for blob in pretrained_layers[0].blobs
+        #]
+
+        #blob_shape = utils.CaffeBlobToNumpyArray(layer.bottom[0].blobs).shape
+        #print blob_shape
+
+        #net, net_params, input_dims = kwargs['net'], kwargs['net_params'], kwargs['input_dims']
+        #n, c, h, w = input_dims
+        #dummy_input = np.random.randn(n, c, h, w).astype(np.float32)
+        #dim_map = _GetBlobDimMap(net, net_params, dummy_input)
+        #caffe_op = BaseTranslate(layer, "Dummy")
+        #input_1 = caffe_op.input[1]
+        #input_1_dim = dim_map[input_1]
+        #print input_1_dim
+        #print pretrained_blobs
+
         # the scale parameter is in pretrained blobs
         if scale_param.num_axes != 1:
             raise RuntimeError("This path has not been verified yet.")
+
 
         output = mul_op.output[0]
         mul_op_param = output + '_w'
